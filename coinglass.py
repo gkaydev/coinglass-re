@@ -8,8 +8,6 @@ import zlib
 import httpx
 from Crypto.Cipher import AES
 
-_OBE_TOKEN = "s_463bd7363fdd4662b7400bcb13aefb54"
-
 _V_RAW_KEYS: dict[str, str] = {
     "55": "170b070da9654622",
     "66": "d6537d845a964081",
@@ -40,13 +38,18 @@ def _decrypt_inner_key(encrypted_user_hdr: str, outer_key: bytes) -> bytes:
     return decompressed.strip('"').encode()
 
 
-async def fetch_liquidation_map(symbol: str) -> dict:
+async def fetch_liquidation_map(
+    symbol: str,
+    *,
+    interval: str = "1",
+    limit: str = "1500",
+    obe_token: str | None = None,
+) -> dict:
     cache_ts_ms = str(int(time.time() * 1000))
 
     headers = {
         "cache-ts-v2": cache_ts_ms,
         "encryption": "true",
-        "obe": _OBE_TOKEN,
         "language": "en",
         "origin": "https://www.coinglass.com",
         "referer": "https://www.coinglass.com/",
@@ -56,23 +59,36 @@ async def fetch_liquidation_map(symbol: str) -> dict:
             "Chrome/124.0.0.0 Safari/537.36"
         ),
     }
+    if obe_token:
+        headers["obe"] = obe_token
 
     async with httpx.AsyncClient() as client:
         resp = await client.get(
             _BASE_URL,
-            params={"merge": "true", "symbol": symbol, "interval": "5", "limit": "2000"},
+            params={"merge": "true", "symbol": symbol, "interval": interval, "limit": limit},
             headers=headers,
         )
+
+    body = resp.json()
+    if body.get("success") is False:
+        if body.get("code") == "40000":
+            raise RuntimeError(
+                "coinglass rejected the request (not logged in) — the liquidation "
+                "map endpoints now require an authenticated session. Pass your "
+                "browser's 'obe' cookie value as obe_token= to fetch_liquidation_map()."
+            )
+        raise RuntimeError(f"coinglass rejected the request: {body}")
 
     resp_headers = resp.headers
     v_hdr = resp_headers.get("v", "")
     time_hdr = resp_headers.get("time", "")
     encrypted_user_hdr = resp_headers.get("user", "")
+    if not encrypted_user_hdr:
+        raise RuntimeError("coinglass response carried no 'user' header to derive the inner key from")
 
     outer_key = _derive_outer_key(v_hdr, time_hdr)
     inner_key = _decrypt_inner_key(encrypted_user_hdr, outer_key)
 
-    body = resp.json()
     encrypted_payload = body["data"]
 
     raw = _aes_ecb_decrypt_bytes(encrypted_payload, inner_key)
